@@ -83,3 +83,8 @@ artifact/*
 # Staged runtime shared libraries for prebuilt fuzzers (binaries, rebuildable).
 fuzzingbrain/analyzer/runtime_libs/*.so
 fuzzingbrain/analyzer/runtime_libs/*.so.*
+
+# FMS baseline outputs/cache/verbatim upstream copy
+FMS/runs/
+FMS/cache/
+FMS/legacy/
