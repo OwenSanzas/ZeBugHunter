@@ -13,6 +13,7 @@ from ..core import logger
 from ..db import RepositoryManager
 from ..analyzer import AnalysisClient
 from ..core.config import DEFAULT_MAX_PARALLEL_FUZZERS
+from ..core.ablation import no_fuzzers as _ablate_no_fuzzers
 from ..fuzzer import (
     FuzzerManager,
     register_fuzzer_manager,
@@ -113,7 +114,12 @@ class WorkerExecutor:
         self.scan_mode = scan_mode
         self.log_dir = Path(log_dir) if log_dir else None
         self.docker_image = docker_image
-        self.enable_fuzzer_worker = enable_fuzzer_worker
+        self.enable_fuzzer_worker = enable_fuzzer_worker and not _ablate_no_fuzzers()
+        logger.info(
+            "[ABLATION] FB_ABLATE_NO_FUZZERS="
+            + ("ON: no Global / SP fuzzers, PoVs come from the agents only"
+               if _ablate_no_fuzzers() else "off")
+        )
         self.max_parallel_fuzzers = max_parallel_fuzzers
         self.sp_max_count = sp_max_count
         self.celery_job_id = celery_job_id
