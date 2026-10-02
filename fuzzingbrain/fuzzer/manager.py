@@ -1,0 +1,727 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Fuzzer Manager
+
+Worker-level manager for fuzzer instances.
+Manages Global Fuzzer and SP Fuzzer Pool.
+
+Note: FuzzerMonitor is now Task-level (passed in from Dispatcher).
+"""
+
+import hashlib
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from loguru import logger
+
+from .models import (
+    CrashRecord,
+    FuzzerType,
+    GlobalFuzzerConfig,
+    SPFuzzerConfig,
+    SeedInfo,
+)
+from ..core.fuzzer_spec import is_no_oom
+from .budget import DEFAULT_MAX_PARALLEL_FUZZERS, FuzzerBudget
+from .instance import FuzzerInstance
+from .monitor import FuzzerMonitor
+
+
+class FuzzerManager:
+    """
+    Worker-level Fuzzer Manager.
+
+    Responsibilities:
+    - Manage Global Fuzzer for this worker
+    - Manage SP Fuzzer Pool for this worker
+    - Register/unregister crash directories with Task-level FuzzerMonitor
+    - Seed routing (Direction/FP -> Global, POV blob -> SP)
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        worker_id: str,
+        fuzzer_path: Path,
+        docker_image: str,
+        workspace_path: Path,
+        fuzzer_name: str = "",
+        sanitizer: str = "address",
+        global_config: Optional[GlobalFuzzerConfig] = None,
+        sp_config: Optional[SPFuzzerConfig] = None,
+        crash_monitor: Optional[FuzzerMonitor] = None,
+        max_parallel_fuzzers: int = DEFAULT_MAX_PARALLEL_FUZZERS,
+    ):
+        """
+        Initialize FuzzerManager.
+
+        Args:
+            task_id: Parent task ID
+            worker_id: Worker identifier
+            fuzzer_path: Path to fuzzer binary
+            docker_image: Docker image for running fuzzers
+            workspace_path: Worker workspace path
+            fuzzer_name: Fuzzer binary name
+            sanitizer: Sanitizer type
+            global_config: Configuration for Global Fuzzer
+            sp_config: Configuration for SP Fuzzers
+            crash_monitor: Task-level FuzzerMonitor (shared across workers)
+            max_parallel_fuzzers: task-wide ceiling on running fuzzers
+        """
+        self.task_id = task_id
+        self.worker_id = worker_id
+        self.fuzzer_path = Path(fuzzer_path)
+        self.docker_image = docker_image
+        self.workspace_path = Path(workspace_path)
+        self.fuzzer_name = fuzzer_name or self.fuzzer_path.name
+        self.sanitizer = sanitizer
+
+        # Configurations
+        self.global_config = global_config or GlobalFuzzerConfig()
+        self.sp_config = sp_config or SPFuzzerConfig()
+
+        # Global Fuzzer
+        self.global_fuzzer: Optional[FuzzerInstance] = None
+
+        # SP Fuzzer Pool: sp_id -> FuzzerInstance
+        self.sp_fuzzers: Dict[str, FuzzerInstance] = {}
+
+        # Task-level Crash Monitor (shared, passed from Dispatcher)
+        # If not provided, create a worker-local one (for backward compatibility)
+        if crash_monitor is not None:
+            self.crash_monitor = crash_monitor
+            self._owns_crash_monitor = False
+        else:
+            # Backward compatibility: create worker-local monitor
+            self.crash_monitor = FuzzerMonitor(task_id=task_id)
+            self._owns_crash_monitor = True
+
+        # Directories
+        self.fuzzer_workspace = workspace_path / "fuzzer_worker"
+        self.global_corpus_dir = self.fuzzer_workspace / "global" / "corpus"
+        self.global_crashes_dir = self.fuzzer_workspace / "global" / "crashes"
+        self.sp_base_dir = self.fuzzer_workspace / "sp_fuzzers"
+
+        # Ensure directories exist
+        self.global_corpus_dir.mkdir(parents=True, exist_ok=True)
+        self.global_crashes_dir.mkdir(parents=True, exist_ok=True)
+        self.sp_base_dir.mkdir(parents=True, exist_ok=True)
+
+        # Seed tracking
+        self.direction_seeds: List[SeedInfo] = []
+        self.fp_seeds: List[SeedInfo] = []
+        self.probe_seeds: List[SeedInfo] = []
+
+        # The task's allowance of concurrent fuzzers, shared with every other
+        # worker through Redis. Slot names carry the worker id because every
+        # worker calls its own global fuzzer "global".
+        self.budget = FuzzerBudget(task_id=task_id, limit=max_parallel_fuzzers)
+
+        logger.info(
+            f"[{worker_id}] ╔══════════════════════════════════════════════════════════════╗"
+        )
+        logger.info(
+            f"[{worker_id}] ║              FUZZER WORKER INITIALIZED                       ║"
+        )
+        logger.info(
+            f"[{worker_id}] ╠══════════════════════════════════════════════════════════════╣"
+        )
+        logger.info(f"[{worker_id}] ║  Fuzzer: {self.fuzzer_name:<50} ║")
+        logger.info(f"[{worker_id}] ║  Sanitizer: {sanitizer:<47} ║")
+        logger.info(
+            f"[{worker_id}] ╚══════════════════════════════════════════════════════════════╝"
+        )
+
+    def _slot(self, instance_id: str) -> str:
+        """This fuzzer's name in the task-wide ledger.
+
+        The worker id is part of it because every worker names its own global
+        fuzzer "global", and two workers must not share one slot.
+        """
+        return f"{self.worker_id}:{instance_id}"
+
+    # =========================================================================
+    # Global Fuzzer Management
+    # =========================================================================
+
+    async def start_global_fuzzer(self, initial_seeds: List[bytes] = None) -> bool:
+        """
+        Start the Global Fuzzer.
+
+        Args:
+            initial_seeds: Optional initial seeds to add to corpus
+
+        Returns:
+            True if started successfully
+        """
+        if self.global_fuzzer and self.global_fuzzer.is_running():
+            logger.warning(
+                f"[FuzzerManager:{self.worker_id}] Global fuzzer already running"
+            )
+            return False
+
+        # Take a slot before spending anything on setup. The global fuzzer is
+        # started first, before this worker's POV agents ask for theirs, so it
+        # is the one that gets a slot when the task is near its ceiling.
+        if not self.budget.acquire(self._slot("global"), kind="global fuzzer"):
+            logger.warning(
+                f"[{self.worker_id}] Global fuzzer not started: the task is at "
+                f"its limit of {self.budget.limit} concurrent fuzzers"
+            )
+            return False
+
+        # Create instance
+        self.global_fuzzer = FuzzerInstance(
+            instance_id="global",
+            fuzzer_path=self.fuzzer_path,
+            docker_image=self.docker_image,
+            corpus_dir=self.global_corpus_dir,
+            crashes_dir=self.global_crashes_dir,
+            fuzzer_type=FuzzerType.GLOBAL,
+            config=self.global_config,
+            task_id=self.task_id,
+            no_oom=is_no_oom(self.fuzzer_name),
+            sanitizer=self.sanitizer,
+        )
+
+        # Add initial seeds
+        if initial_seeds:
+            for i, seed in enumerate(initial_seeds):
+                self.global_fuzzer.add_seed(seed, f"initial_{i:04d}")
+
+        # Register crash directory for monitoring (with worker_id)
+        self.crash_monitor.add_watch_dir(
+            crash_dir=self.global_crashes_dir,
+            worker_id=self.worker_id,
+            source="global",
+            fuzzer_name=self.fuzzer_name,
+            sanitizer=self.sanitizer,
+            fuzzer_path=self.fuzzer_path,
+            docker_image=self.docker_image,
+        )
+
+        # Start monitoring if we own the monitor and it's not running
+        if self._owns_crash_monitor and not self.crash_monitor._running:
+            self.crash_monitor.start_monitoring()
+
+        # Start fuzzer
+        success = await self.global_fuzzer.start()
+        if success:
+            # Create .active marker for auto-discovery
+            active_marker = self.fuzzer_workspace / "global" / ".active"
+            active_marker.touch()
+
+            logger.info(
+                f"[{self.worker_id}] ┌─────────────────────────────────────────┐"
+            )
+            logger.info(
+                f"[{self.worker_id}] │  🚀 GLOBAL FUZZER STARTED (fork={self.global_config.fork_level})     │"
+            )
+            logger.info(
+                f"[{self.worker_id}] └─────────────────────────────────────────┘"
+            )
+        else:
+            self.budget.release(self._slot("global"))
+            logger.error(f"[{self.worker_id}] ❌ GLOBAL FUZZER FAILED TO START")
+
+        return success
+
+    async def stop_global_fuzzer(self) -> None:
+        """Stop the Global Fuzzer."""
+        if self.global_fuzzer:
+            await self.global_fuzzer.stop()
+            self.budget.release(self._slot("global"))
+            self.crash_monitor.remove_watch_dir(self.worker_id, "global")
+
+            # Remove .active marker
+            active_marker = self.fuzzer_workspace / "global" / ".active"
+            active_marker.unlink(missing_ok=True)
+
+            logger.info(f"[FuzzerManager:{self.worker_id}] Global fuzzer stopped")
+
+    def add_direction_seed(self, seed: bytes, direction_id: str) -> Path:
+        """
+        Add a Direction seed to Global Fuzzer.
+
+        Args:
+            seed: Raw seed bytes
+            direction_id: Direction ID that generated this seed
+
+        Returns:
+            Path to saved seed file
+        """
+        if not self.global_fuzzer:
+            # Save to corpus dir even if fuzzer not started yet
+            seed_hash = hashlib.sha1(seed).hexdigest()[:16]
+            seed_path = (
+                self.global_corpus_dir / f"direction_{direction_id[:8]}_{seed_hash}"
+            )
+            seed_path.write_bytes(seed)
+        else:
+            seed_path = self.global_fuzzer.add_seed(
+                seed,
+                f"direction_{direction_id[:8]}_{hashlib.sha1(seed).hexdigest()[:8]}",
+            )
+
+        # Track seed
+        seed_info = SeedInfo(
+            seed_path=str(seed_path),
+            seed_hash=hashlib.sha1(seed).hexdigest(),
+            seed_size=len(seed),
+            source="direction",
+            direction_id=direction_id,
+        )
+        self.direction_seeds.append(seed_info)
+
+        logger.debug(
+            f"[FuzzerManager:{self.worker_id}] Added direction seed: "
+            f"direction={direction_id[:8]}, size={len(seed)}"
+        )
+        return seed_path
+
+    def add_fp_seed(self, seed: bytes, sp_id: str) -> Path:
+        """
+        Add an FP (False Positive) seed to Global Fuzzer.
+
+        Args:
+            seed: Raw seed bytes
+            sp_id: SP ID that was determined to be FP
+
+        Returns:
+            Path to saved seed file
+        """
+        if not self.global_fuzzer:
+            seed_hash = hashlib.sha1(seed).hexdigest()[:16]
+            seed_path = self.global_corpus_dir / f"fp_{sp_id[:8]}_{seed_hash}"
+            seed_path.write_bytes(seed)
+        else:
+            seed_path = self.global_fuzzer.add_seed(
+                seed, f"fp_{sp_id[:8]}_{hashlib.sha1(seed).hexdigest()[:8]}"
+            )
+
+        # Track seed
+        seed_info = SeedInfo(
+            seed_path=str(seed_path),
+            seed_hash=hashlib.sha1(seed).hexdigest(),
+            seed_size=len(seed),
+            source="fp",
+            sp_id=sp_id,
+        )
+        self.fp_seeds.append(seed_info)
+
+        logger.debug(
+            f"[FuzzerManager:{self.worker_id}] Added FP seed: "
+            f"sp={sp_id[:8]}, size={len(seed)}"
+        )
+        return seed_path
+
+    def add_probe_seed(self, seed: bytes, sp_id: str, to_sp_fuzzer: bool) -> Path:
+        """
+        Add an input an agent built with reach_probe / check_clamp.
+
+        A probe input is aimed at one SP and often reaches it, which makes it a
+        good seed. `to_sp_fuzzer` puts it in that SP's fuzzer corpus (a PoV agent's
+        probe, next to its create_pov variants); otherwise in the Global corpus (a
+        verifier's probe: the SP fuzzer does not exist yet at verification time).
+        A fuzzer that is not running yet picks the file up from its corpus
+        directory when it starts.
+
+        Args:
+            seed: Raw input bytes
+            sp_id: SP the probe was aimed at
+            to_sp_fuzzer: SP fuzzer corpus instead of the Global one
+
+        Returns:
+            Path to saved seed file
+        """
+        seed_hash = hashlib.sha1(seed).hexdigest()
+        name = f"probe_{sp_id[:8]}_{seed_hash[:8]}"
+        if to_sp_fuzzer:
+            if sp_id in self.sp_fuzzers:
+                seed_path = self.sp_fuzzers[sp_id].add_seed(seed, name)
+            else:
+                sp_corpus_dir = self.sp_base_dir / sp_id / "corpus"
+                sp_corpus_dir.mkdir(parents=True, exist_ok=True)
+                seed_path = sp_corpus_dir / name
+                seed_path.write_bytes(seed)
+        elif self.global_fuzzer:
+            seed_path = self.global_fuzzer.add_seed(seed, name)
+        else:
+            seed_path = self.global_corpus_dir / name
+            seed_path.write_bytes(seed)
+
+        self.probe_seeds.append(
+            SeedInfo(
+                seed_path=str(seed_path),
+                seed_hash=seed_hash,
+                seed_size=len(seed),
+                source="probe",
+                sp_id=sp_id,
+            )
+        )
+        logger.debug(
+            f"[FuzzerManager:{self.worker_id}] Added probe seed: sp={sp_id[:8]}, "
+            f"{'SP' if to_sp_fuzzer else 'Global'} corpus, size={len(seed)}"
+        )
+        return seed_path
+
+    # =========================================================================
+    # SP Fuzzer Management
+    # =========================================================================
+
+    async def start_sp_fuzzer(self, sp_id: str) -> bool:
+        """
+        Start an SP Fuzzer for a specific suspicious point.
+
+        Args:
+            sp_id: Suspicious point ID
+
+        Returns:
+            True if started successfully
+        """
+        if sp_id in self.sp_fuzzers and self.sp_fuzzers[sp_id].is_running():
+            logger.warning(
+                f"[FuzzerManager:{self.worker_id}] SP fuzzer already running: {sp_id[:8]}"
+            )
+            return False
+
+        running = sum(1 for f in self.sp_fuzzers.values() if f.is_running())
+        if running >= self.sp_config.max_count:
+            logger.info(
+                f"[{self.worker_id}] SP fuzzer for {sp_id[:8]} skipped: this "
+                f"worker already runs {running} of them"
+            )
+            return False
+
+        # An SP fuzzer is a bonus alongside the POV agent, not a requirement:
+        # when the task is at its ceiling the agent runs without one, which is
+        # why the caller treats False as "carry on" rather than as an error.
+        if not self.budget.acquire(self._slot(sp_id), kind="SP fuzzer"):
+            logger.info(
+                f"[{self.worker_id}] SP fuzzer for {sp_id[:8]} skipped: the task "
+                f"is at its limit of {self.budget.limit} concurrent fuzzers"
+            )
+            return False
+
+        # Create directories for this SP
+        sp_corpus_dir = self.sp_base_dir / sp_id / "corpus"
+        sp_crashes_dir = self.sp_base_dir / sp_id / "crashes"
+        sp_corpus_dir.mkdir(parents=True, exist_ok=True)
+        sp_crashes_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create instance
+        sp_fuzzer = FuzzerInstance(
+            instance_id=sp_id,
+            fuzzer_path=self.fuzzer_path,
+            docker_image=self.docker_image,
+            corpus_dir=sp_corpus_dir,
+            crashes_dir=sp_crashes_dir,
+            fuzzer_type=FuzzerType.SP,
+            config=self.sp_config,
+            task_id=self.task_id,
+            no_oom=is_no_oom(self.fuzzer_name),
+            sanitizer=self.sanitizer,
+        )
+
+        # Register crash directory (with worker_id)
+        self.crash_monitor.add_watch_dir(
+            crash_dir=sp_crashes_dir,
+            worker_id=self.worker_id,
+            source=sp_id,
+            fuzzer_name=self.fuzzer_name,
+            sanitizer=self.sanitizer,
+            fuzzer_path=self.fuzzer_path,
+            docker_image=self.docker_image,
+        )
+
+        # Start monitoring if we own the monitor and it's not running
+        if self._owns_crash_monitor and not self.crash_monitor._running:
+            self.crash_monitor.start_monitoring()
+
+        # Start fuzzer
+        success = await sp_fuzzer.start()
+        if success:
+            self.sp_fuzzers[sp_id] = sp_fuzzer
+
+            # Create .active marker for auto-discovery
+            active_marker = self.sp_base_dir / sp_id / ".active"
+            active_marker.touch()
+
+            logger.info(
+                f"[{self.worker_id}] ▶ SP FUZZER STARTED: {sp_id[:8]} (total: {len(self.sp_fuzzers)})"
+            )
+        else:
+            self.budget.release(self._slot(sp_id))
+            logger.error(f"[{self.worker_id}] ❌ SP FUZZER FAILED: {sp_id[:8]}")
+
+        return success
+
+    def _pool_sp_corpus_into_global(self, sp_id: str) -> int:
+        """Copy a stopped SP fuzzer's corpus (and crash inputs, the deepest
+        seeds) into the global corpus, deduplicated by content.
+
+        SP fuzzers keep separate corpora, so the seeds an SP fuzzer evolved to
+        reach a specific sink die with it. The global fuzzer runs with -fork and
+        libFuzzer's default -reload, so once these units land in the global
+        corpus dir it picks them up and mutates them -- letting a seed that
+        reached deep code become a springboard for a nearby bug no single SP
+        fuzzer reaches. Verified on shadowsocks (json_parse_ex, 5 bugs): per-SP
+        fuzzing found 2/5 lines, pooling every SP corpus surfaced all 5.
+
+        Oversized inputs (e.g. a 1 GiB OOM attempt) are junk that only slows the
+        fuzzer -- the real bugs trigger on tiny inputs -- so they are skipped.
+
+        Returns the number of new seeds added to the global corpus.
+        """
+        import hashlib
+
+        MAX_SEED_BYTES = 1_048_576
+        added = 0
+        sp_dir = self.sp_base_dir / sp_id
+        for sub in ("corpus", "crashes"):
+            src = sp_dir / sub
+            if not src.is_dir():
+                continue
+            for f in src.iterdir():
+                if not f.is_file():
+                    continue
+                try:
+                    data = f.read_bytes()
+                except Exception:
+                    continue
+                if not data or len(data) > MAX_SEED_BYTES:
+                    continue
+                dst = self.global_corpus_dir / f"sp_{hashlib.sha1(data).hexdigest()}"
+                if dst.exists():
+                    continue
+                try:
+                    dst.write_bytes(data)
+                    added += 1
+                except Exception:
+                    pass
+        return added
+
+    async def stop_sp_fuzzer(self, sp_id: str) -> None:
+        """
+        Stop an SP Fuzzer.
+
+        Args:
+            sp_id: Suspicious point ID
+        """
+        if sp_id not in self.sp_fuzzers:
+            return
+
+        await self.sp_fuzzers[sp_id].stop()
+        self.budget.release(self._slot(sp_id))
+        self.crash_monitor.remove_watch_dir(self.worker_id, sp_id)
+
+        # Remove .active marker
+        active_marker = self.sp_base_dir / sp_id / ".active"
+        active_marker.unlink(missing_ok=True)
+
+        # Pool this SP fuzzer's evolved seeds into the global corpus before it is
+        # gone, so the still-running global fuzzer keeps mutating them. The SP
+        # fuzzer process is already stopped, so its corpus is frozen and safe to
+        # copy.
+        try:
+            pooled = self._pool_sp_corpus_into_global(sp_id)
+            if pooled:
+                logger.info(
+                    f"[{self.worker_id}] Pooled {pooled} seeds from SP "
+                    f"{sp_id[:8]} into global corpus"
+                )
+        except Exception as e:
+            logger.warning(
+                f"[{self.worker_id}] Failed to pool SP {sp_id[:8]} corpus: {e}"
+            )
+
+        del self.sp_fuzzers[sp_id]
+
+        logger.info(f"[{self.worker_id}] ■ SP FUZZER STOPPED: {sp_id[:8]}")
+
+    def add_pov_blob(
+        self,
+        blob: bytes,
+        sp_id: str,
+        attempt: int = 0,
+        variant: int = 0,
+    ) -> Optional[Path]:
+        """
+        Add a POV blob to the corresponding SP Fuzzer's corpus.
+
+        Args:
+            blob: Raw POV blob bytes
+            sp_id: Suspicious point ID
+            attempt: POV attempt number
+            variant: POV variant number
+
+        Returns:
+            Path to saved blob file, or None if SP fuzzer not found
+        """
+        if sp_id not in self.sp_fuzzers:
+            # SP fuzzer not started yet, save to directory anyway
+            sp_corpus_dir = self.sp_base_dir / sp_id / "corpus"
+            sp_corpus_dir.mkdir(parents=True, exist_ok=True)
+
+            blob_hash = hashlib.sha1(blob).hexdigest()[:8]
+            blob_path = sp_corpus_dir / f"pov_a{attempt}_v{variant}_{blob_hash}"
+            blob_path.write_bytes(blob)
+
+            logger.debug(
+                f"[FuzzerManager:{self.worker_id}] Saved POV blob (SP fuzzer not started): "
+                f"sp={sp_id[:8]}, attempt={attempt}, variant={variant}"
+            )
+            return blob_path
+
+        # Add to running SP fuzzer
+        blob_path = self.sp_fuzzers[sp_id].add_seed(
+            blob, f"pov_a{attempt}_v{variant}_{hashlib.sha1(blob).hexdigest()[:8]}"
+        )
+
+        logger.debug(
+            f"[FuzzerManager:{self.worker_id}] Added POV blob to SP fuzzer: "
+            f"sp={sp_id[:8]}, attempt={attempt}, variant={variant}"
+        )
+        return blob_path
+
+    # =========================================================================
+    # Status and Management
+    # =========================================================================
+
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Get status of all fuzzers.
+
+        Returns:
+            Status dictionary
+        """
+        status = {
+            "task_id": self.task_id,
+            "worker_id": self.worker_id,
+            "fuzzer_name": self.fuzzer_name,
+            "sanitizer": self.sanitizer,
+            "global_fuzzer": None,
+            "sp_fuzzers": {},
+            "crash_monitor": self.crash_monitor.get_stats(),
+            "seed_counts": {
+                "direction_seeds": len(self.direction_seeds),
+                "fp_seeds": len(self.fp_seeds),
+                "probe_seeds": len(self.probe_seeds),
+            },
+        }
+
+        # Global fuzzer status
+        if self.global_fuzzer:
+            status["global_fuzzer"] = self.global_fuzzer.get_stats()
+
+        # SP fuzzer statuses
+        for sp_id, sp_fuzzer in self.sp_fuzzers.items():
+            status["sp_fuzzers"][sp_id] = sp_fuzzer.get_stats()
+
+        return status
+
+    def get_active_sp_fuzzers(self) -> List[str]:
+        """Get list of active SP fuzzer IDs."""
+        return [
+            sp_id for sp_id, fuzzer in self.sp_fuzzers.items() if fuzzer.is_running()
+        ]
+
+    def get_total_crashes(self) -> int:
+        """Get total number of crashes found by this worker's fuzzers."""
+        return len(self.crash_monitor.get_crashes_by_worker(self.worker_id))
+
+    def get_crashes_for_sp(self, sp_id: str) -> List[CrashRecord]:
+        """
+        Get crashes found by a specific SP Fuzzer.
+
+        Args:
+            sp_id: Suspicious point ID
+
+        Returns:
+            List of crash records
+        """
+        return self.crash_monitor.get_crashes_by_source(self.worker_id, sp_id)
+
+    async def restart_global_fuzzer(self) -> bool:
+        """
+        Restart the Global Fuzzer.
+
+        Called when Global Fuzzer finds a crash and is stopped.
+
+        Returns:
+            True if restarted successfully
+        """
+        logger.info(f"[FuzzerManager:{self.worker_id}] Restarting global fuzzer")
+        await self.stop_global_fuzzer()
+        return await self.start_global_fuzzer()
+
+    async def shutdown_sp_fuzzers_only(self) -> None:
+        """
+        Shutdown only SP fuzzers, keep Global Fuzzer running.
+
+        Called when Worker completes but Global Fuzzer should continue.
+        """
+        logger.info(
+            f"[FuzzerManager:{self.worker_id}] Shutting down SP fuzzers only, "
+            f"Global Fuzzer continues running..."
+        )
+
+        # Stop all SP fuzzers
+        for sp_id in list(self.sp_fuzzers.keys()):
+            await self.stop_sp_fuzzer(sp_id)
+
+        logger.info(
+            f"[FuzzerManager:{self.worker_id}] SP fuzzers stopped, "
+            f"Global Fuzzer still running"
+        )
+
+    async def shutdown(self) -> None:
+        """
+        Shutdown all fuzzers for this worker.
+
+        Note: Does NOT stop the FuzzerMonitor (that's Task-level, managed by Dispatcher).
+        """
+        logger.info(f"[FuzzerManager:{self.worker_id}] Shutting down...")
+
+        # Stop all SP fuzzers
+        for sp_id in list(self.sp_fuzzers.keys()):
+            await self.stop_sp_fuzzer(sp_id)
+
+        # Stop global fuzzer
+        await self.stop_global_fuzzer()
+
+        # Only stop monitor if we own it (backward compatibility)
+        if self._owns_crash_monitor:
+            self.crash_monitor.stop_monitoring()
+
+        logger.info(f"[FuzzerManager:{self.worker_id}] Shutdown complete")
+
+    def __repr__(self) -> str:
+        return (
+            f"FuzzerManager(worker_id={self.worker_id}, "
+            f"global={'running' if self.global_fuzzer and self.global_fuzzer.is_running() else 'stopped'}, "
+            f"sp_count={len(self.sp_fuzzers)})"
+        )
+
+
+# =============================================================================
+# Global Manager Registry (for cross-module access)
+# =============================================================================
+
+_fuzzer_managers: Dict[str, FuzzerManager] = {}
+
+
+def register_fuzzer_manager(worker_id: str, manager: FuzzerManager) -> None:
+    """Register a FuzzerManager for cross-module access."""
+    _fuzzer_managers[worker_id] = manager
+
+
+def get_fuzzer_manager(worker_id: str) -> Optional[FuzzerManager]:
+    """Get FuzzerManager by worker_id."""
+    return _fuzzer_managers.get(worker_id)
+
+
+def unregister_fuzzer_manager(worker_id: str) -> None:
+    """Unregister a FuzzerManager."""
+    if worker_id in _fuzzer_managers:
+        del _fuzzer_managers[worker_id]

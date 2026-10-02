@@ -1,0 +1,85 @@
+# Python bytecode
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Virtual environments
+**/venv/
+
+**/paper/**
+# Workspace / runtime data
+**/workspace/
+**/workspace/*
+work/
+
+# Logs
+**/logs/
+*.log
+
+# Temp / test output
+**/tmp_*
+**/test_*
+!tests/test_*
+test_trace_output/
+
+# User-specific config
+**/examples/llm_config.local.yaml
+fuzzingbrain/llm_config.local.yaml
+task_view_*/
+documentation/analysis/
+experiment/
+
+# Test / coverage artifacts
+**/coverage.xml
+**/coverage.json
+**/.coverage
+htmlcov/
+**/.pytest_cache/
+**/.benchmarks/
+**/.benchmark_results/
+
+# Eval server runtime
+.eval_pids/
+FBv2-Dashboard/
+
+# External repos (cloned locally, has its own .git)
+Z-Code-Analyzer-Station/
+
+# Environment secrets
+**/.env
+.env.*
+!.env.example
+
+# Internal working notes, not shipped
+internal/
+
+# uv, when the bootstrap installs it locally
+.uv/
+fuzzingbrain/eval_server
+fuzzingbrain/dashboard
+
+# AIxCC challenge data: keep the metadata, leave the bulk on disk.
+# The graphs (5.1 GB) and fuzzer binaries (10.3 GB) are both rebuildable from
+# source, and experiments read them from the working tree anyway. The PoV blobs
+# are NOT ignored -- 880 KB total, and nothing can regenerate them.
+examples/aixcc-challenges/**/mongodb/
+examples/aixcc-challenges/**/bugs/*/bin/
+dynamic-analysis/
+
+# Experiments: data, runs and one-off scripts, kept out of git
+experiments/
+
+# --- Packaging: experiment DATA stays OUT of the code repo ---
+# artifact/ holds graphs, prebuilt fuzzers, rq outputs (~32 GB). Distributed as
+# a separate DATA bundle, never committed here. The small scaffold scripts
+# (run.sh, run_batch.sh, preflight.py, batches/batch1.txt) stay tracked.
+artifact/*
+!artifact/run.sh
+!artifact/run_batch.sh
+!artifact/preflight.py
+!artifact/batches
+
+# Staged runtime shared libraries for prebuilt fuzzers (binaries, rebuildable).
+fuzzingbrain/analyzer/runtime_libs/*.so
+fuzzingbrain/analyzer/runtime_libs/*.so.*

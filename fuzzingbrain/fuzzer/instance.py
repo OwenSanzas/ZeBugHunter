@@ -1,0 +1,465 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Fuzzer Instance
+
+Encapsulates a single libFuzzer process.
+"""
+
+import asyncio
+import hashlib
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+from loguru import logger
+
+from ..core.docker_limits import docker_resource_args, task_label_args
+from ..core.fuzzer_spec import (
+    libfuzzer_oom_flags,
+    run_lib_docker_args,
+    NO_OOM_MEMORY_MB,
+)
+from .models import (
+    CRASH_ARTIFACT_PREFIXES,
+    FuzzerStatus,
+    FuzzerType,
+    FuzzerStats,
+    GlobalFuzzerConfig,
+    SPFuzzerConfig,
+    SeedInfo,
+)
+
+
+class FuzzerInstance:
+    """
+    Single Fuzzer Instance.
+
+    Encapsulates libFuzzer process startup, shutdown, and monitoring.
+    Runs fuzzer in Docker container for isolation.
+    """
+
+    def __init__(
+        self,
+        instance_id: str,  # "global" or sp_id
+        fuzzer_path: Path,
+        docker_image: str,
+        corpus_dir: Path,
+        crashes_dir: Path,
+        fuzzer_type: FuzzerType = FuzzerType.GLOBAL,
+        config: Union[GlobalFuzzerConfig, SPFuzzerConfig] = None,
+        task_id: str = "",
+        no_oom: bool = False,
+        sanitizer: str = "address",
+    ):
+        """
+        Initialize FuzzerInstance.
+
+        Args:
+            instance_id: Unique identifier ("global" or sp_id)
+            fuzzer_path: Path to fuzzer binary
+            docker_image: Docker image for running fuzzer
+            corpus_dir: Directory for corpus seeds
+            crashes_dir: Directory for crash outputs
+            fuzzer_type: GLOBAL or SP
+            config: Fuzzer configuration
+            task_id: Owning task; stamped on the container as a label so the
+                controller can kill it after the worker process is gone
+        """
+        self.instance_id = instance_id
+        self.task_id = str(task_id or "")
+        self.fuzzer_path = Path(fuzzer_path)
+        self.docker_image = docker_image
+        self.corpus_dir = Path(corpus_dir)
+        self.crashes_dir = Path(crashes_dir)
+        self.fuzzer_type = fuzzer_type
+        self.sanitizer = (sanitizer or "address").lower()
+        # @NO_OOM target: disable libFuzzer's allocator guard (else a memory-heavy
+        # decoder floods /crashes with OOM "crashes" and never reaches deep sinks).
+        self.no_oom = no_oom
+
+        # Configuration
+        if config is None:
+            if fuzzer_type == FuzzerType.GLOBAL:
+                config = GlobalFuzzerConfig()
+            else:
+                config = SPFuzzerConfig()
+        self.config = config
+
+        # Process management
+        self.process: Optional[asyncio.subprocess.Process] = None
+        self.container_id: Optional[str] = None
+        self._output_task: Optional[asyncio.Task] = None
+        self.status = FuzzerStatus.IDLE
+
+        # Statistics
+        self.stats = FuzzerStats(
+            instance_id=instance_id,
+            fuzzer_type=fuzzer_type,
+        )
+
+        # Seed tracking
+        self.seeds: List[SeedInfo] = []
+
+        # Ensure directories exist
+        self.corpus_dir.mkdir(parents=True, exist_ok=True)
+        self.crashes_dir.mkdir(parents=True, exist_ok=True)
+
+        logger.debug(
+            f"[Fuzzer:{instance_id}] Initialized: type={fuzzer_type.value}, "
+            f"corpus={corpus_dir}, crashes={crashes_dir}"
+        )
+
+    def _build_docker_command(self) -> List[str]:
+        """
+        Build Docker command for running fuzzer.
+
+        Returns:
+            List of command arguments
+        """
+        fuzzer_dir = self.fuzzer_path.parent
+        fuzzer_name = self.fuzzer_path.name
+
+        # Libs staged next to the binary + vendored fallback libs (libc++ etc.);
+        # vendored dir mounted separately and appended last (see run_lib_docker_args).
+        vendor_lib_args, _ld_library_path = run_lib_docker_args(fuzzer_dir, "/fuzzers")
+
+        # Base command
+        cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "--platform",
+            "linux/amd64",
+            "--entrypoint",
+            "",  # Bypass base-runner's entrypoint
+            *task_label_args(self.task_id),
+        ]
+
+        # Cap the container itself: fork mode runs fork_level children, each
+        # allowed rss_limit_mb, plus ASAN/runtime headroom. A @NO_OOM target has
+        # no per-process libFuzzer guard, so the cgroup is the only bound -- give
+        # it real headroom or a legitimate large decode gets SIGKILLed.
+        fork = max(self.config.fork_level, 1)
+        container_mem = (
+            NO_OOM_MEMORY_MB
+            if self.no_oom
+            else self.config.rss_limit_mb * fork + 1024
+        )
+        cmd.extend(
+            docker_resource_args(
+                memory_mb=container_mem,
+                cpus=fork,
+            )
+        )
+
+        # Environment variables. SANITIZER and the *_OPTIONS must match the task's
+        # actual sanitizer (was hard-coded to address, which is wrong for memory/
+        # undefined builds). detect_leaks=0 for ASan (an incidental leak must not be
+        # promoted to a bogus PoV that stops the run); halt_on_error for MSan/UBSan
+        # so a finding aborts and libFuzzer records it.
+        _san_opt = {
+            "address": "ASAN_OPTIONS=detect_leaks=0",
+            "memory": "MSAN_OPTIONS=halt_on_error=1",
+            "undefined": "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1",
+        }.get(self.sanitizer, "ASAN_OPTIONS=detect_leaks=0")
+        cmd.extend(
+            [
+                "-e",
+                "FUZZING_ENGINE=libfuzzer",
+                "-e",
+                f"SANITIZER={self.sanitizer}",
+                "-e",
+                "ARCHITECTURE=x86_64",
+                "-e",
+                _san_opt,
+                *(
+                    ["-e", f"LD_LIBRARY_PATH={_ld_library_path}"]
+                    if _ld_library_path
+                    else []
+                ),
+            ]
+        )
+
+        # Mount volumes
+        cmd.extend(
+            [
+                *vendor_lib_args,
+                "-v",
+                f"{fuzzer_dir}:/fuzzers:ro",
+                "-v",
+                f"{self.corpus_dir}:/corpus",
+                "-v",
+                f"{self.crashes_dir}:/crashes",
+            ]
+        )
+
+        # Docker image
+        cmd.append(self.docker_image)
+
+        # Fuzzer command
+        cmd.append(f"/fuzzers/{fuzzer_name}")
+
+        # libFuzzer arguments
+        cmd.extend(
+            [
+                "/corpus",
+                "-artifact_prefix=/crashes/",
+                f"-fork={self.config.fork_level}",
+                # Keep fuzzing after a crash instead of stopping at the first one.
+                # A harness can hide several bugs (shadowsocks json_fuzz has 5 in
+                # json_parse_ex); without this the fuzzer finds the shallowest and
+                # quits, never reaching the others. Each distinct crash is still
+                # saved to /crashes for the monitor to pick up and score.
+                "-ignore_crashes=1",
+                # @NO_OOM: disable the allocator guard (-rss_limit_mb=0
+                # -malloc_limit_mb=0); otherwise use the configured limit.
+                *(
+                    libfuzzer_oom_flags(True)
+                    if self.no_oom
+                    else [f"-rss_limit_mb={self.config.rss_limit_mb}"]
+                ),
+                f"-timeout={self.config.timeout_per_input}",
+                "-print_final_stats=1",
+            ]
+        )
+
+        # Max time for global fuzzer only
+        if self.fuzzer_type == FuzzerType.GLOBAL:
+            if hasattr(self.config, "max_time") and self.config.max_time > 0:
+                cmd.append(f"-max_total_time={self.config.max_time}")
+
+        return cmd
+
+    async def start(self) -> bool:
+        """
+        Start the fuzzer process.
+
+        Returns:
+            True if started successfully
+        """
+        if self.status in [FuzzerStatus.RUNNING, FuzzerStatus.STARTING]:
+            logger.warning(f"[Fuzzer:{self.instance_id}] Already running")
+            return False
+
+        self.status = FuzzerStatus.STARTING
+        self.stats.start_time = datetime.now()
+        self.stats.stop_time = None
+
+        try:
+            # Build command
+            cmd = self._build_docker_command()
+            logger.info(
+                f"[Fuzzer:{self.instance_id}] Starting: {' '.join(cmd[:10])}..."
+            )
+
+            # Start process. Merge stderr into stdout so a single reader drains
+            # both streams (libFuzzer writes to stderr, base-runner to stdout).
+            self.process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+
+            self.status = FuzzerStatus.RUNNING
+            self.stats.status = FuzzerStatus.RUNNING
+
+            # Continuously drain stdout/stderr. libFuzzer is very verbose and
+            # will block on write once the OS pipe buffer fills if nobody reads
+            # it, silently stalling the fuzzer. _parse_output also keeps the
+            # live coverage/exec-rate stats up to date.
+            self._output_task = asyncio.create_task(self._parse_output())
+
+            logger.info(
+                f"[Fuzzer:{self.instance_id}] Started (PID: {self.process.pid})"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"[Fuzzer:{self.instance_id}] Failed to start: {e}")
+            self.status = FuzzerStatus.ERROR
+            self.stats.status = FuzzerStatus.ERROR
+            return False
+
+    async def stop(self, timeout: float = 10.0) -> None:
+        """
+        Stop the fuzzer process.
+
+        Args:
+            timeout: Seconds to wait before force kill
+        """
+        if self.process is None or self.status == FuzzerStatus.STOPPED:
+            return
+
+        logger.info(f"[Fuzzer:{self.instance_id}] Stopping...")
+
+        try:
+            # Try graceful termination first
+            self.process.terminate()
+
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                # Force kill if not responding
+                logger.warning(f"[Fuzzer:{self.instance_id}] Force killing...")
+                self.process.kill()
+                await self.process.wait()
+
+        except ProcessLookupError:
+            # Process already dead
+            pass
+        except Exception as e:
+            logger.error(f"[Fuzzer:{self.instance_id}] Error stopping: {e}")
+
+        # Stop draining output; the process is gone so the reader would just
+        # see EOF, but cancel explicitly to avoid a dangling task.
+        if self._output_task is not None:
+            self._output_task.cancel()
+            self._output_task = None
+
+        self.status = FuzzerStatus.STOPPED
+        self.stats.status = FuzzerStatus.STOPPED
+        self.stats.stop_time = datetime.now()
+        self.process = None
+
+        logger.info(f"[Fuzzer:{self.instance_id}] Stopped")
+
+    def add_seed(self, seed: bytes, name: str = None) -> Path:
+        """
+        Add a seed to the corpus directory.
+
+        The fuzzer will automatically pick up new files (~2 seconds).
+
+        Args:
+            seed: Raw seed bytes
+            name: Optional filename (auto-generated if None)
+
+        Returns:
+            Path to the saved seed file
+        """
+        # Generate filename from hash if not provided
+        if name is None:
+            seed_hash = hashlib.sha1(seed).hexdigest()[:16]
+            name = f"seed_{seed_hash}"
+
+        seed_path = self.corpus_dir / name
+
+        # Write seed
+        seed_path.write_bytes(seed)
+
+        # Track seed
+        seed_info = SeedInfo(
+            seed_path=str(seed_path),
+            seed_hash=hashlib.sha1(seed).hexdigest(),
+            seed_size=len(seed),
+        )
+        self.seeds.append(seed_info)
+
+        logger.debug(
+            f"[Fuzzer:{self.instance_id}] Added seed: {name} ({len(seed)} bytes)"
+        )
+        return seed_path
+
+    def add_seeds(self, seeds: List[bytes], prefix: str = "seed") -> List[Path]:
+        """
+        Add multiple seeds to corpus.
+
+        Args:
+            seeds: List of seed bytes
+            prefix: Filename prefix
+
+        Returns:
+            List of saved seed paths
+        """
+        paths = []
+        for i, seed in enumerate(seeds):
+            name = f"{prefix}_{i:04d}"
+            path = self.add_seed(seed, name)
+            paths.append(path)
+        return paths
+
+    def get_crashes(self) -> List[Path]:
+        """
+        Get all crash files from crashes directory.
+
+        Returns:
+            List of crash file paths
+        """
+        crashes = []
+        for f in self.crashes_dir.iterdir():
+            if f.is_file() and f.name.startswith(CRASH_ARTIFACT_PREFIXES):
+                crashes.append(f)
+        return sorted(crashes, key=lambda p: p.stat().st_mtime, reverse=True)
+
+    def get_corpus_size(self) -> int:
+        """Get number of files in corpus."""
+        return sum(1 for f in self.corpus_dir.iterdir() if f.is_file())
+
+    def is_running(self) -> bool:
+        """Check if fuzzer is currently running."""
+        if self.process is None:
+            return False
+        return self.process.returncode is None
+
+    async def wait(self) -> int:
+        """
+        Wait for fuzzer process to complete.
+
+        Returns:
+            Process return code
+        """
+        if self.process is None:
+            return -1
+
+        return await self.process.wait()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get fuzzer statistics.
+
+        Returns:
+            Statistics dictionary
+        """
+        self.stats.corpus_size = self.get_corpus_size()
+        self.stats.crashes_found = len(self.get_crashes())
+
+        return self.stats.to_dict()
+
+    async def _parse_output(self) -> None:
+        """Parse fuzzer output for statistics (background task)."""
+        if self.process is None or self.process.stdout is None:
+            return
+
+        try:
+            async for line in self.process.stdout:
+                line_str = line.decode("utf-8", errors="replace").strip()
+
+                # Parse coverage info
+                cov_match = re.search(r"cov:\s*(\d+)", line_str)
+                if cov_match:
+                    self.stats.edge_coverage = int(cov_match.group(1))
+
+                # Parse feature coverage
+                ft_match = re.search(r"ft:\s*(\d+)", line_str)
+                if ft_match:
+                    self.stats.feature_coverage = int(ft_match.group(1))
+
+                # Parse exec/s
+                exec_match = re.search(r"exec/s:\s*(\d+)", line_str)
+                if exec_match:
+                    self.stats.execs_per_sec = float(exec_match.group(1))
+
+                # Detect crash
+                if "ERROR:" in line_str or "SUMMARY:" in line_str:
+                    if self.status == FuzzerStatus.RUNNING:
+                        self.status = FuzzerStatus.FOUND_CRASH
+                        self.stats.status = FuzzerStatus.FOUND_CRASH
+
+        except Exception as e:
+            logger.debug(f"[Fuzzer:{self.instance_id}] Output parsing error: {e}")
+
+    def __repr__(self) -> str:
+        return (
+            f"FuzzerInstance(id={self.instance_id}, "
+            f"type={self.fuzzer_type.value}, status={self.status.value})"
+        )

@@ -1,0 +1,799 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Derive a HarnessSpec from a FuzzingBrain-Bench bug directory.
+
+A bench bug is a self-contained target: ``bench.yaml`` (project, repo, vulnerable
+commit, language), a ``harness/`` directory (one libFuzzer source plus a
+``build.sh`` exposing the uniform ``build-libs`` / ``harness <config>`` contract),
+and a ``Dockerfile`` listing apt build deps. This module reads those and produces
+a :class:`~fuzzingbrain.importers.external_harness.HarnessSpec` so V2 can build
+and fuzz the bug through the normal pipeline.
+
+The generated OSS-Fuzz ``build_script`` reuses the bench's own ``build.sh``
+verbatim — it already emits a libFuzzer+sanitizer binary at
+``/out/<config>/harness`` — and copies the result to ``$OUT``. The config is
+chosen from ``$SANITIZER`` (coverage vs an asan variant), so the same recipe
+serves every bench project regardless of its build system (autoconf, cmake,
+meson, gn).
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import yaml
+
+from .external_harness import HarnessSpec
+
+# Sources are these extensions; everything else in harness/ (build.sh, *.md) is
+# support and copied verbatim but not treated as the fuzzer entry point.
+_SRC_EXTS = (".c", ".cc", ".cpp", ".cxx", ".c++")
+
+# apt packages that collide with base-builder's own toolchain. base-builder
+# ships its (newer) clang + compiler-rt; reinstalling Debian's shadows them and
+# breaks the build. Keep everything else (autoconf, meson, ninja, libclang-dev
+# for bindgen, ...).
+_TOOLCHAIN_PKG = re.compile(r"^(clang(-\d+)?|llvm(-\d+)?|libclang-rt-[\w.-]+)$")
+
+_LANG_MAP = {"c": "c", "c++": "c++", "cpp": "c++", "cxx": "c++", "jvm": "jvm"}
+
+# Rust toolchain packages: their presence means the build invokes cargo/rustc
+# (e.g. harfbuzz's fontations crate, fwupd) — base-builder lacks Rust, so switch
+# to base-builder-rust which ships clang *and* the Rust toolchain.
+_RUST_PKG = re.compile(r"^(cargo|rustc|rustup)$")
+
+_BASE = "gcr.io/oss-fuzz-base/base-builder"
+
+
+def _select_base_image(language: str, needs_rust: bool) -> str:
+    """Pick the OSS-Fuzz builder image that carries the needed toolchain."""
+    if language == "jvm":
+        return f"{_BASE}-jvm"  # Jazzer + JDK
+    if needs_rust:
+        return f"{_BASE}-rust"  # clang + cargo/rustc
+    return _BASE
+
+
+def _needs_rust(apt_deps: list[str], dockerfile_text: str, build_sh_text: str) -> bool:
+    """Detect a Rust toolchain dependency from any available signal.
+
+    Bench bugs declare Rust three ways: an apt cargo/rustc package, a rustup
+    bootstrap in the Dockerfile (harfbuzz), or a cargo invocation in build.sh.
+    """
+    if any(_RUST_PKG.match(p) for p in apt_deps):
+        return True
+    if re.search(r"rustup|RUSTUP_HOME|CARGO_HOME", dockerfile_text):
+        return True
+    return bool(re.search(r"\bcargo\b", build_sh_text))
+
+
+def _parse_apt_deps(dockerfile: Path) -> list[str]:
+    """Best-effort extraction of apt packages from the bench Dockerfile."""
+    if not dockerfile.is_file():
+        return []
+    text = dockerfile.read_text()
+    m = re.search(r"apt-get install[^\n]*?-y[^\n]*?(.+?)(?:&&|\n\n|\Z)", text, re.S)
+    if not m:
+        return []
+    blob = m.group(1)
+    pkgs = []
+    for tok in blob.replace("\\", " ").split():
+        if tok.startswith("-") or "=" in tok or tok in ("rm", "rf", "apt-get"):
+            continue
+        if tok.startswith("--") or "/" in tok:
+            continue
+        if _TOOLCHAIN_PKG.match(tok):
+            continue
+        pkgs.append(tok)
+    # de-dup, preserve order
+    seen, out = set(), []
+    for p in pkgs:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _parse_dockerfile_args(text: str) -> dict:
+    """Collect `ARG NAME=default` defaults for ${NAME} substitution."""
+    args = {}
+    for m in re.finditer(r"^\s*ARG\s+([A-Za-z_]\w*)=(\S+)", text, re.M):
+        args[m.group(1)] = m.group(2)
+    return args
+
+
+def _subst(value: str, args: dict) -> str:
+    """Resolve ${NAME} / $NAME against ARG defaults."""
+
+    def repl(m):
+        return args.get(m.group(1) or m.group(2), m.group(0))
+
+    return re.sub(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)", repl, value)
+
+
+def _normalize_repo(url: str) -> str:
+    return url.rstrip("/").removesuffix(".git").lower()
+
+
+def _parse_clones(
+    dockerfile: Path, main_repo: str
+) -> tuple[str, bool, str, list[dict]]:
+    """Parse `git clone <url> /src[/<dir>]` (+ checkout) lines from the Dockerfile.
+
+    Returns (main_dir, main_flatten, main_ref, extra_clones). main_dir is the /src
+    directory the build.sh expects the target source at (matched to main_repo);
+    main_flatten is True when the main repo is cloned to /src itself (so its
+    contents sit directly under /src, e.g. mongoose/dtc); main_ref is the ref the
+    Dockerfile checks the target out at; extra_clones are the dependency repos the
+    build needs at their own fixed /src paths.
+    """
+    if not dockerfile.is_file():
+        return "", False, "", []
+    text = dockerfile.read_text()
+    # Join shell line-continuations so a clone split across lines (e.g. openscreen's
+    # `git clone -b $TAG \<newline> <url> /src/jsoncpp`) is seen as one command.
+    text = re.sub(r"\\\s*\n", " ", text)
+    args = _parse_dockerfile_args(text)
+
+    clones = []
+    # `git clone [flags...] <url> /src[/<dir>]` — flags (e.g. --depth 1,
+    # --filter=blob:none, -b <tag>) sit between; the URL is the last token before
+    # the dir. The subdir is optional: some bugs clone straight into /src ("flatten").
+    for m in re.finditer(
+        r"git clone\s+(.+?)\s+((?:/src|\$SRC)(?:/\S+)?)(?:\s|$)", text
+    ):
+        flags = m.group(1)
+        url = _subst(flags.split()[-1], args)
+        d = _subst(m.group(2), args).replace("${SRC}", "/src").replace("$SRC", "/src")
+        # ref: prefer an explicit `git -C <dir> checkout <ref>`, else `-b <tag>`.
+        cm = re.search(rf"git -C\s+{re.escape(m.group(2))}\s+checkout\s+(\S+)", text)
+        if cm:
+            ref = _subst(cm.group(1), args)
+        else:
+            bm = re.search(r"(?:^|\s)(?:-b|--branch)[= ]+(\S+)", flags)
+            ref = _subst(bm.group(1), args) if bm else ""
+        clones.append({"url": url, "dir": d.rstrip("/"), "ref": ref})
+
+    main_dir, flatten, main_ref, extra = "", False, "", []
+    norm_main = _normalize_repo(main_repo)
+    matched = False
+    for c in clones:
+        if not matched and _normalize_repo(c["url"]) == norm_main:
+            matched = True
+            main_ref = c["ref"]
+            if c["dir"] == "/src":
+                flatten = True
+            else:
+                main_dir = c["dir"].rsplit("/", 1)[-1]
+        else:
+            extra.append(c)
+    return main_dir, flatten, main_ref, extra
+
+
+# ENV keys base-builder owns — overriding them breaks its clang toolchain.
+# LIB_FUZZING_ENGINE is base-builder's libFuzzer archive; the bench Dockerfiles
+# point it at a debian-only clang path (/usr/lib/clang/14/...) that does not exist
+# on base-builder, so it must stay base-builder's.
+_PROTECTED_ENV = re.compile(
+    r"^(CC|CXX|CFLAGS|CXXFLAGS|SANITIZER|OUT|SRC|WORK|LIB_FUZZING_ENGINE)\b"
+)
+
+
+def _parse_setup_steps(dockerfile_text: str, args: dict) -> list[str]:
+    """Carry over toolchain-setup ENV/RUN directives from the bench Dockerfile.
+
+    Bench bugs install non-apt toolchains (a pinned JDK+maven for avro, a rustup
+    nightly + bindgen for harfbuzz) via Dockerfile RUN/ENV steps. We replicate
+    those verbatim, skipping what the importer already handles (apt, the clones,
+    the harness COPY/build) and ENV that would clobber base-builder's compiler.
+
+    Toolchain setup always precedes the project clone (verified across avro,
+    harfbuzz, ...); anything after the clone is the project *build* (e.g. fwupd's
+    ``oss-fuzz.py``), which must run in build.sh after helper.py bind-mounts the
+    repo — not as an image step that the mount would discard. So stop at the clone.
+    """
+    text = re.sub(r"\\\s*\n", " ", dockerfile_text)  # join line-continuations
+    steps: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"(\w+)\s+(.*)", line)
+        if not m:
+            continue
+        instr, rest = m.group(1).upper(), _subst(m.group(2), args)
+        if instr == "ENV":
+            if _PROTECTED_ENV.match(rest.lstrip()):
+                continue
+            steps.append(f"ENV {rest}")
+        elif instr == "RUN":
+            low = rest.lower()
+            if re.search(r"git\s+clone\b.*(?:/src|\$src)", low):
+                break  # reached the project clone; the rest is the build
+            # Skip what the importer handles itself: apt, clones, the /out
+            # bundling, and the bench build.sh (reused via build_script). The
+            # build.sh skip matters for bugs with no clone to break on (graal
+            # resolves deps from Maven Central instead of cloning source).
+            if any(
+                s in low for s in ("apt-get", "git clone", "/out", "harness/build.sh")
+            ):
+                continue
+            if "chmod" in low and "harness" in low:
+                continue
+            steps.append(f"RUN {rest}")
+    return steps
+
+
+# A Dockerfile that copies a prebuilt `<name>_fuzzer` into /out/<cfg>/harness has
+# built the harness itself (fwupd's oss-fuzz.py), rather than via harness/build.sh.
+_DOCKERFILE_OUT_CP = re.compile(r"cp\s+(\S+)\s+/out/\S*harness")
+
+
+def _dockerfile_harness_output(dockerfile_text: str) -> str:
+    """Return the fuzzer basename the Dockerfile copies into /out, or ""."""
+    text = re.sub(r"\\\s*\n", " ", dockerfile_text)
+    m = _DOCKERFILE_OUT_CP.search(text)
+    return m.group(1).rsplit("/", 1)[-1] if m else ""
+
+
+def _dockerfile_build_recipe(dockerfile_text: str, args: dict) -> list[str]:
+    """Post-clone build commands the Dockerfile runs *instead of* harness/build.sh.
+
+    For most bugs this is empty (the Dockerfile just calls harness/build.sh, which
+    the importer reuses). fwupd builds via ``contrib/ci/oss-fuzz.py`` (plus sed
+    patches for the logitech targets) and copies the result into /out — those are
+    the commands to replay in build.sh.
+    """
+    text = re.sub(r"\\\s*\n", " ", dockerfile_text)
+    recipe: list[str] = []
+    seen_clone = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"(\w+)\s+(.*)", line)
+        if not m:
+            continue
+        instr, rest = m.group(1).upper(), _subst(m.group(2), args)
+        low = rest.lower()
+        if instr == "RUN" and re.search(r"git\s+clone\b.*(?:/src|\$src)", low):
+            seen_clone = True
+            continue
+        if not seen_clone or instr != "RUN":
+            continue
+        # Skip the importer-handled bits: harness/build.sh (reused separately) and
+        # the /out bundling (we copy the target fuzzer ourselves).
+        if "harness/build.sh" in low or "/out" in low:
+            continue
+        if "chmod" in low and "harness" in low:
+            continue
+        recipe.append(rest)
+    return recipe
+
+
+def _dockerfile_build_script(project: str, recipe: list[str], produced: str) -> str:
+    """build.sh body for a bug whose harness is built by the bench Dockerfile.
+
+    Runs the Dockerfile's own build (e.g. fwupd's oss-fuzz.py) at compile time —
+    after the bind-mount, so source patches stick — redirecting its many fuzzer
+    outputs to scratch and exposing only the target one in $OUT.
+    """
+    steps = "".join(f"{s}\n" for s in recipe)
+    return (
+        "set -eu\n"
+        "git config --global --add safe.directory '*' || true\n"
+        # oss-fuzz.py's rustgen.py runs `python` (base-builder's /usr/local/bin one);
+        # its jinja2 is separate from the apt python3-jinja2, so install it there.
+        "python -m pip install --quiet jinja2 >/dev/null 2>&1 || "
+        "pip3 install --quiet jinja2 >/dev/null 2>&1 || true\n"
+        f'cd "$SRC/{project}"\n'
+        '_FB_OUT="$OUT"\n'
+        # The Dockerfile build emits every project fuzzer into $OUT; redirect that
+        # to scratch so $OUT ends up holding only this bug's target.
+        'export OUT="${WORK:-/tmp}/fb_dockerbuild_out"; rm -rf "$OUT"; mkdir -p "$OUT"\n'
+        f"{steps}"
+        f'cp "$OUT/{produced}" "$_FB_OUT/{produced}"\n'
+        'export OUT="$_FB_OUT"\n'
+        f'echo "built $OUT/{produced} ($(stat -c %s "$OUT/{produced}") bytes)"\n'
+    )
+
+
+def _detect_libs_cmd(build_sh_text: str) -> str:
+    """Find the library-build subcommand name, which varies across bench bugs.
+
+    Most use ``build-libs``; some rename it (openldap: ``openldap-libs``). A few
+    have no separate libs step (mongoose: just ``build.sh <config>``) -> "".
+    """
+    m = re.search(r"usage:\s*build\.sh\s+([A-Za-z][\w-]*)\s*\|", build_sh_text)
+    if m and m.group(1) != "harness":
+        return m.group(1)
+    m = re.search(r'=\s*"([A-Za-z][\w-]*-libs)"', build_sh_text)
+    return m.group(1) if m else ""
+
+
+# base-builder is Ubuntu focal (glibc 2.31, Linux 5.4 UAPI). Modern projects
+# (systemd) reference kernel/glibc symbols newer than that. The bench targets
+# debian bookworm where they exist natively; backfill the gaps so the same source
+# compiles on focal. Every definition is guarded (#ifndef / __GLIBC_PREREQ), so
+# on a newer base where they exist this header is inert. x86_64.
+_FOCAL_COMPAT_SHIM = r"""#ifndef FB_COMPAT_H
+#define FB_COMPAT_H
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+/* x86_64 syscall numbers added after Linux 5.4 */
+#ifndef __NR_pivot_root
+#define __NR_pivot_root 155
+#endif
+#ifndef __NR_set_mempolicy
+#define __NR_set_mempolicy 238
+#endif
+#ifndef __NR_get_mempolicy
+#define __NR_get_mempolicy 239
+#endif
+#ifndef __NR_add_key
+#define __NR_add_key 248
+#endif
+#ifndef __NR_request_key
+#define __NR_request_key 249
+#endif
+#ifndef __NR_keyctl
+#define __NR_keyctl 250
+#endif
+#ifndef __NR_ioprio_set
+#define __NR_ioprio_set 251
+#endif
+#ifndef __NR_ioprio_get
+#define __NR_ioprio_get 252
+#endif
+#ifndef __NR_rt_tgsigqueueinfo
+#define __NR_rt_tgsigqueueinfo 297
+#endif
+#ifndef __NR_kcmp
+#define __NR_kcmp 312
+#endif
+#ifndef __NR_sched_setattr
+#define __NR_sched_setattr 314
+#endif
+#ifndef __NR_kexec_file_load
+#define __NR_kexec_file_load 320
+#endif
+#ifndef __NR_bpf
+#define __NR_bpf 321
+#endif
+#ifndef __NR_execveat
+#define __NR_execveat 322
+#endif
+#ifndef __NR_pidfd_send_signal
+#define __NR_pidfd_send_signal 424
+#endif
+#ifndef __NR_open_tree
+#define __NR_open_tree 428
+#endif
+#ifndef __NR_move_mount
+#define __NR_move_mount 429
+#endif
+#ifndef __NR_fsopen
+#define __NR_fsopen 430
+#endif
+#ifndef __NR_fsconfig
+#define __NR_fsconfig 431
+#endif
+#ifndef __NR_fsmount
+#define __NR_fsmount 432
+#endif
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+#ifndef __NR_close_range
+#define __NR_close_range 436
+#endif
+#ifndef __NR_openat2
+#define __NR_openat2 437
+#endif
+#ifndef __NR_faccessat2
+#define __NR_faccessat2 439
+#endif
+#ifndef __NR_mount_setattr
+#define __NR_mount_setattr 442
+#endif
+#ifndef __NR_quotactl_fd
+#define __NR_quotactl_fd 443
+#endif
+#ifndef __NR_fchmodat2
+#define __NR_fchmodat2 452
+#endif
+#ifndef __NR_setxattrat
+#define __NR_setxattrat 463
+#endif
+#ifndef __NR_removexattrat
+#define __NR_removexattrat 466
+#endif
+#ifndef __NR_open_tree_attr
+#define __NR_open_tree_attr 467
+#endif
+/* siginfo codes (ARM MTE), added ~5.10. Include signal.h first: on a newer base
+   these are enum constants (with a companion macro), so #ifndef then skips and we
+   avoid clobbering the enum; focal lacks them entirely, so we define the macro. */
+#include <signal.h>
+#ifndef SEGV_MTEAERR
+#define SEGV_MTEAERR 8
+#endif
+#ifndef SEGV_MTESERR
+#define SEGV_MTESERR 9
+#endif
+/* glibc 2.33+ mallinfo2 over focal 2.31's mallinfo() */
+#include <features.h>
+#if defined(__GLIBC__) && (!defined(__GLIBC_PREREQ) || !__GLIBC_PREREQ(2,33))
+#include <malloc.h>
+struct mallinfo2 {
+  __SIZE_TYPE__ arena, ordblks, smblks, hblks, hblkhd, usmblks,
+                fsmblks, uordblks, fordblks, keepcost;
+};
+__attribute__((unused)) static struct mallinfo2 mallinfo2(void) {
+  struct mallinfo _m = mallinfo();
+  struct mallinfo2 _r = { (__SIZE_TYPE__)_m.arena, (__SIZE_TYPE__)_m.ordblks,
+    (__SIZE_TYPE__)_m.smblks, (__SIZE_TYPE__)_m.hblks, (__SIZE_TYPE__)_m.hblkhd,
+    (__SIZE_TYPE__)_m.usmblks, (__SIZE_TYPE__)_m.fsmblks, (__SIZE_TYPE__)_m.uordblks,
+    (__SIZE_TYPE__)_m.fordblks, (__SIZE_TYPE__)_m.keepcost };
+  return _r;
+}
+#endif
+#endif
+"""
+
+
+def _compat_shim_lines() -> str:
+    """Write the focal-compat shim and force it into every compile via -include."""
+    return (
+        "cat > /tmp/fb_compat.h <<'FB_COMPAT_EOF'\n"
+        + _FOCAL_COMPAT_SHIM
+        + "FB_COMPAT_EOF\n"
+        'export CFLAGS="${CFLAGS:-} -include /tmp/fb_compat.h"\n'
+        'export CXXFLAGS="${CXXFLAGS:-} -include /tmp/fb_compat.h"\n'
+    )
+
+
+def _build_script(fuzzer_name: str, libs_cmd: str = "build-libs") -> str:
+    """OSS-Fuzz build.sh body that drives the bench harness build.
+
+    Reuses ``$SRC/harness/build.sh`` (the bench's own recipe) and selects a
+    config that matches ``$SANITIZER``. Robust to interface variation across
+    bench projects: tries the detected libs step then ``build-libs``, and invokes
+    each config as both ``harness <cfg>`` and bare ``<cfg>``.
+    """
+    libs_list = " ".join(dict.fromkeys(filter(None, [libs_cmd, "build-libs"])))
+    return (
+        "set -eu\n"
+        # The repo is bind-mounted with host ownership; without this, git in the
+        # build container refuses to operate ("dubious ownership"), breaking any
+        # build.sh that runs submodule update / autoreconf (e.g. jq, oniguruma).
+        "git config --global --add safe.directory '*' || true\n"
+        # base-builder (Ubuntu 20.04) ships gettext 0.19; projects whose
+        # configure.ac requires 0.20+ (hunspell) abort in autopoint during
+        # autoreconf. Fuzzing needs no translations, so skip autopoint — the m4
+        # macros these projects ship are enough for configure.
+        'export AUTOPOINT="${AUTOPOINT:-true}"\n'
+        # Bench harnesses target debian's default GNU libstdc++: they link
+        # -lstdc++ and none use base-builder's libc++ $LIB_FUZZING_ENGINE. But
+        # base-builder forces -stdlib=libc++ via CXXFLAGS, so sub-builds that
+        # inherit the env (libheif's libde265) compile against libc++ and then
+        # fail to link the GNU harness ("undefined symbol: std::__1::..."). Drop
+        # -stdlib=libc++ to keep the whole build on GNU libstdc++, as the bench
+        # intends. Defaults guard against unset vars under `set -u`.
+        'export CFLAGS="${CFLAGS:-}"; export CFLAGS="${CFLAGS//-stdlib=libc++/}"\n'
+        'export CXXFLAGS="${CXXFLAGS:-}"; '
+        'export CXXFLAGS="${CXXFLAGS//-stdlib=libc++/}"\n'
+        # Some projects enable LTO/IPO (FreeRDP, open62541:
+        # CMAKE_INTERPROCEDURAL_OPTIMIZATION=ON), so their static libs hold LLVM
+        # bitcode .o members. A bench harness that links with bare `clang` gets
+        # base-builder's default /usr/bin/ld (GNU BFD), which cannot read bitcode
+        # ("file format not recognized"). Point ld at lld, which links bitcode
+        # natively and is GNU-compatible — a safe drop-in for non-LTO builds too.
+        "if command -v ld.lld >/dev/null 2>&1; then "
+        'ln -sf "$(command -v ld.lld)" "${FB_LD_PATH:-/usr/bin/ld}" 2>/dev/null'
+        " || true; fi\n" + _compat_shim_lines() +
+        # Backfill focal's old kernel/glibc gaps (newer syscalls, mallinfo2) so
+        # modern sources (systemd) compile; inert on a newer base (all guarded).
+        # systemd's EFI boot stub (src/boot) raises a configure-time hard error if
+        # the linker can't do -static-pie. base-builder's focal toolchain can't
+        # under ASAN (the bench's debian can), but the boot stub is never built
+        # for the hwdb/PE fuzzers — soften the error so meson configures and then
+        # compiles only the fuzzer target. The sed matches systemd's exact string,
+        # so it is a no-op for every other project.
+        'find "$SRC" -path "*/src/boot/meson.build" -exec sed -i '
+        "\"s/error('Linker does not support -static-pie.')/"
+        "message('(fb) -static-pie unavailable on base-builder; EFI boot stub "
+        "skipped for fuzzing')/\" {} + 2>/dev/null || true\n"
+        'BS="$SRC/harness/build.sh"\n'
+        "L_LOG=/tmp/fb_libs.log\n"
+        # Optional library-build step; name varies, some projects have none.
+        f'for L in {libs_list}; do bash "$BS" "$L" >"$L_LOG" 2>&1 && break || true; done\n'
+        'if [ "${SANITIZER:-address}" = "coverage" ]; then\n'
+        '  CFGS="coverage"\n'
+        "else\n"
+        '  CFGS="release-asan debug-asan debug"\n'
+        "fi\n"
+        'built=""\n'
+        "for c in $CFGS; do\n"
+        # Try "harness <cfg>" (most) then bare "<cfg>" (mongoose-style). Capture
+        # output per config so a real failure is visible (no silent /dev/null).
+        '  bash "$BS" harness "$c" >"/tmp/fb_$c.log" 2>&1 '
+        '|| bash "$BS" "$c" >"/tmp/fb_$c.log" 2>&1 || true\n'
+        '  if [ -f "$OUT/$c/harness" ]; then\n'
+        f'    cp "$OUT/$c/harness" "$OUT/{fuzzer_name}"\n'
+        '    built="$c"; break\n'
+        "  fi\n"
+        "done\n"
+        'if [ -z "$built" ]; then\n'
+        '  echo "no harness config built; build.sh output follows:" >&2\n'
+        '  tail -n 40 "$L_LOG" /tmp/fb_*.log 2>/dev/null >&2 || true\n'
+        "  exit 1\n"
+        "fi\n"
+    )
+
+
+# base-builder-jvm's default JDK is focal's openjdk-11 (class file v55), but the
+# bench targets debian bookworm's default-jdk (JDK 17) and ships JDK-17 bytecode
+# deps (GraalVM 24.x polyglot is v61). Point JAVA_HOME at the newest system JDK
+# >= 17 (base-builder-jvm bundles java-17-openjdk), unless the bench installed its
+# own JDK (avro's /opt/jdk21), which we keep. Used at build time and in the
+# runtime Jazzer wrapper so compile and run agree on the JDK.
+_JVM_JDK_SELECT = (
+    'case "${JAVA_HOME:-}" in\n'
+    "  /opt/*) : ;;\n"  # bench-installed JDK (avro /opt/jdk21) — keep
+    "  *) for _v in 17 21; do\n"
+    '       _d="${FB_JVM_DIR:-/usr/lib/jvm}/java-${_v}-openjdk-amd64"\n'
+    '       [ -x "$_d/bin/javac" ] && { export JAVA_HOME="$_d"; break; }\n'
+    "     done ;;\n"
+    "esac\n"
+    'export PATH="$JAVA_HOME/bin:$PATH"\n'
+)
+
+
+def _jvm_build_script(target_class: str, out_name: str, libs_cmd: str) -> str:
+    """Build a Jazzer fuzz target from a bench JVM bug.
+
+    The bench's own ``harness`` step emits a plain-``java`` reproducer (for the
+    grader), not a fuzz target — but it also assembles ``/out/lib`` (the compiled
+    harness ``classes`` plus the project and dependency jars) with the *correct*
+    classpath. We reuse that assembly verbatim (re-deriving the classpath
+    ourselves is brittle — avro/pdfbox need transitive deps), and just drop a
+    standard libFuzzer-compatible Jazzer wrapper at ``$OUT/<class>`` over it.
+    Jazzer is a libFuzzer driver, so V2's existing fuzz loop runs it unchanged.
+    """
+    libs_list = " ".join(dict.fromkeys(filter(None, [libs_cmd, "build-libs"])))
+    return (
+        "set -eu\n"
+        "git config --global --add safe.directory '*' || true\n"
+        + _JVM_JDK_SELECT
+        + 'BS="$SRC/harness/build.sh"\n'
+        # Build the project, then run the bench harness step which populates
+        # $OUT/lib (LIB=/out/lib in the bench recipe) with classes + jars.
+        f'for L in {libs_list}; do bash "$BS" "$L" && break || true; done\n'
+        'built=""\n'
+        "for c in release-asan debug-asan debug; do\n"
+        '  if { bash "$BS" harness "$c" || bash "$BS" "$c"; } '
+        '&& [ -d "$OUT/lib/classes" ]; then built="$c"; break; fi\n'
+        "done\n"
+        '[ -n "$built" ] || { echo "bench harness did not populate \\$OUT/lib" >&2; exit 1; }\n'
+        # Jazzer runtime + a libFuzzer-compatible wrapper over the bench classpath.
+        'cp /usr/local/bin/jazzer_driver /usr/local/bin/jazzer_agent_deploy.jar "$OUT/"\n'
+        f"cat > \"$OUT/{out_name}\" <<'EOF'\n"
+        "#!/bin/bash\n"
+        'this_dir=$(dirname "$0")\n'
+        # Run under the same JDK the harness was compiled with (>= 17), not
+        # base-builder-jvm's default openjdk-11, or JDK-17 deps fail to load.
+         + _JVM_JDK_SELECT + 'cp="$this_dir/lib/classes"\n'
+        'for j in "$this_dir"/lib/*.jar "$this_dir"/lib/deps/*.jar; do '
+        '[ -f "$j" ] && cp="$cp:$j"; done\n'
+        'exec "$this_dir/jazzer_driver" '
+        '--agent_path="$this_dir/jazzer_agent_deploy.jar" \\\n'
+        '  --cp="$cp" '
+        f'--target_class={target_class} --jvm_args="-Xmx2048m" "$@"\n'
+        "EOF\n"
+        f'chmod +x "$OUT/{out_name}"\n'
+    )
+
+
+def _harness_source(harness_dir: Path) -> Path:
+    srcs = sorted(p for p in harness_dir.iterdir() if p.suffix.lower() in _SRC_EXTS)
+    if not srcs:
+        raise ValueError(f"no harness source ({_SRC_EXTS}) in {harness_dir}")
+    return srcs[0]
+
+
+# skia builds through its own GN/Ninja graph, not a free-standing clang link, and
+# the bench's asan config was never validated (only cov was). These are the
+# focal-base-builder accommodations it needs; every one mirrors the validated cov
+# config and none touch the CPU-raster blur bug.
+_SKIA_APT = ("libfreetype6-dev", "libfontconfig1-dev")
+
+
+def _skia_prelude() -> str:
+    """Bash prelude prepended to skia's build script (see _SKIA_APT note).
+
+    * cc/c++ -> clang: GN's asan config leaves cc/cxx at the system default (gcc
+      9 on focal), which rejects clang-only sanitizer flags (-fsanitize=fuzzer,
+      -stdlib=libc++) and lacks -std=c++20. base-builder is clang-based.
+    * ninja on PATH: build.sh calls bare `ninja` but only fetches skia's pinned
+      ninja into third_party/ninja.
+    * Ganesh off: the GPU backend pulls GL headers absent on base-builder and is
+      irrelevant to CPU raster (the cov config disables it too).
+    * asan harness -stdlib=libc++: skia builds the asan libs with libc++, but the
+      harness link omits it -> undefined std::__1 symbols. Add it to the asan link
+      configs only (matched by their `-fsanitize=fuzzer,address` SAN string); the
+      coverage config stays on libstdc++.
+    * build only the needed lib config: build.sh's build-libs builds BOTH the asan
+      and cov GN graphs; we need only the one matching $SANITIZER. Trimming the
+      loop skips a full redundant GN/Ninja pass (and on focal the cov pass fails
+      anyway — its libstdc++ lacks C++20 <compare>), so build-libs stays green.
+    """
+    return (
+        "if command -v clang >/dev/null 2>&1; then "
+        'ln -sf "$(command -v clang)" /usr/local/bin/cc 2>/dev/null || true; '
+        'ln -sf "$(command -v clang++)" /usr/local/bin/c++ 2>/dev/null || true; fi\n'
+        'export PATH="$SRC/skia/third_party/ninja:$PATH"\n'
+        '[ -f "$SRC/skia/gn/skia.gni" ] && '
+        "sed -i 's/skia_enable_ganesh = true/skia_enable_ganesh = false/' "
+        '"$SRC/skia/gn/skia.gni" || true\n'
+        'if [ -f "$SRC/harness/build.sh" ]; then\n'
+        "  sed -i 's/-fsanitize=fuzzer,address\"/-fsanitize=fuzzer,address -stdlib=libc++\"/g' "
+        '"$SRC/harness/build.sh"\n'
+        '  if [ "${SANITIZER:-address}" = "coverage" ]; then _fb_keep=cov; '
+        "else _fb_keep=asan; fi\n"
+        '  sed -i "s/for CONFIG_LIB in asan cov/for CONFIG_LIB in ${_fb_keep}/" '
+        '"$SRC/harness/build.sh"\n'
+        "fi\n"
+    )
+
+
+def _skia_commit_override(bug_dir: Path, vuln_commit: str) -> str:
+    """skia's bench.yaml vuln_commit is an unfetchable chromium-DEPS roll point
+    (skia's public git 500s on it). diffscan.yaml pins the fetchable skia/main
+    tree the bench actually froze for its file/line hints — same bug at the same
+    grader site. Prefer it so the clone lands on a tree that carries the bug."""
+    ds = bug_dir / "diffscan.yaml"
+    if ds.is_file():
+        ds_commit = str((yaml.safe_load(ds.read_text()) or {}).get("commit", "") or "")
+        if ds_commit:
+            return ds_commit
+    return vuln_commit
+
+
+def spec_from_bench_bug(
+    bug_dir: str | Path, with_description: bool = True
+) -> HarnessSpec:
+    """Build a :class:`HarnessSpec` from a bench bug directory.
+
+    Args:
+        bug_dir: Path to a bench bug (contains bench.yaml, harness/, Dockerfile).
+        with_description: Include the bug's description.txt as a direction hint.
+            The bench's task is to reproduce *from a description*, so this is the
+            faithful (and far more effective) mode; set False to measure purely
+            autonomous discovery.
+
+    Returns:
+        A HarnessSpec whose build_script drives the bench's own harness build.
+    """
+    bug_dir = Path(bug_dir)
+    meta = yaml.safe_load((bug_dir / "bench.yaml").read_text())
+    target = meta.get("target", {})
+
+    project = meta["project"]
+    raw_lang = str(target.get("language", "c")).lower()
+    language = _LANG_MAP.get(raw_lang, raw_lang)
+    main_repo = target["repo"]
+    commit = str(target.get("vuln_commit", "") or "")
+
+    # The bench build.sh hard-codes /src/<dir> paths from the bench Dockerfile.
+    # Mount the target there (project = that dir) and replicate dependency clones,
+    # otherwise build.sh fails ("/src/aom: No such file", missing libde265, ...).
+    dockerfile = bug_dir / "Dockerfile"
+    main_dir, main_flatten, main_ref, extra_clones = _parse_clones(
+        dockerfile, main_repo
+    )
+    # The Dockerfile's own checkout of the target is authoritative: when the bench
+    # target.repo is a dependency pinned by tag (openscreen builds jsoncpp@1.9.4),
+    # bench.yaml's vuln_commit names a *different* repo, so prefer the clone ref.
+    if main_ref:
+        commit = main_ref
+    case_fix = ""
+    if main_dir:
+        # The build.sh hard-codes the cased /src/<dir>; use the lower-cased name
+        # as the project and symlink the cased path so the build.sh finds it.
+        if main_dir != main_dir.lower():
+            case_fix = (
+                f'[ -e "$SRC/{main_dir}" ] || '
+                f'ln -sfn "$SRC/{main_dir.lower()}" "$SRC/{main_dir}"\n'
+            )
+        project = main_dir.lower()
+    # OSS-Fuzz requires a lower-case project (it is the docker image tag and the
+    # /src mount dir); cased bench projects (Ghidra, FreeRDP) break the build.
+    project = project.lower()
+    if main_flatten:
+        # The build.sh expects the repo flattened at /src (it hard-codes SRC=/src
+        # and #includes files by bare name). helper.py mounts it at /src/<project>,
+        # so symlink the repo's contents up into /src before building.
+        case_fix += (
+            f'for f in "$SRC/{project}"/* "$SRC/{project}"/.[!.]*; do\n'
+            f'  [ -e "$f" ] && ln -sfn "$f" "$SRC/$(basename "$f")" || true\n'
+            "done\n"
+        )
+
+    harness_dir = bug_dir / "harness"
+    build_sh = harness_dir / "build.sh"
+    build_sh_text = build_sh.read_text() if build_sh.is_file() else ""
+    libs_cmd = _detect_libs_cmd(build_sh_text) if build_sh_text else "build-libs"
+
+    target_class = ""
+    if language == "jvm":
+        # The Jazzer entry class names the fuzz target (bench.yaml entrypoint is
+        # "<Class>.fuzzerTestOneInput"); fall back to the sole .java stem.
+        entry = str(meta.get("harness", {}).get("entrypoint", ""))
+        target_class = entry.rsplit(".", 1)[0] if "." in entry else entry
+        if not target_class:
+            javas = sorted(harness_dir.glob("*.java"))
+            target_class = javas[0].stem if javas else "Fuzzer"
+        fuzzer_name = target_class.rsplit(".", 1)[-1]  # simple name -> $OUT file
+    else:
+        fuzzer_name = _harness_source(harness_dir).stem
+
+    apt_deps = _parse_apt_deps(dockerfile)
+    if project == "skia":
+        commit = _skia_commit_override(bug_dir, commit)
+        apt_deps = list(apt_deps) + [p for p in _SKIA_APT if p not in apt_deps]
+    dockerfile_text = dockerfile.read_text() if dockerfile.is_file() else ""
+    df_args = _parse_dockerfile_args(dockerfile_text)
+    setup_steps = _parse_setup_steps(dockerfile_text, df_args)
+    # Some bugs (fwupd) are not built by harness/build.sh at all — the bench
+    # Dockerfile builds the harness itself (oss-fuzz.py) and copies it into /out.
+    # Detect that and replay the Dockerfile's build in build.sh instead.
+    produced = _dockerfile_harness_output(dockerfile_text)
+    df_recipe = _dockerfile_build_recipe(dockerfile_text, df_args) if produced else []
+    base_image = _select_base_image(
+        language, _needs_rust(apt_deps, dockerfile_text, build_sh_text)
+    )
+    if base_image.endswith("-rust"):
+        # cargo/rustc ship in base-builder-rust; Debian's would shadow them.
+        apt_deps = [p for p in apt_deps if not _RUST_PKG.match(p)]
+    # base-builder's meson is too old for some projects (need >= 0.55) — pull a
+    # current meson/ninja from pip when the project builds with meson. Include
+    # jinja2 under the same (pip) python: systemd's meson.build imports it, and
+    # the apt python3-jinja2 is invisible to the pip-installed meson's python.
+    pip_deps = ["meson", "ninja", "jinja2"] if "meson" in apt_deps else []
+
+    # Copy the whole harness dir except docs; build.sh + sources must be present.
+    harness_files = [
+        str(p)
+        for p in sorted(harness_dir.iterdir())
+        if p.is_file() and p.suffix.lower() != ".md"
+    ]
+
+    description = ""
+    desc_file = bug_dir / "description.txt"
+    if with_description and desc_file.is_file():
+        description = desc_file.read_text(errors="replace").strip()
+
+    return HarnessSpec(
+        project=project,
+        language=language,
+        main_repo=main_repo,
+        commit=commit,
+        harness_files=harness_files,
+        apt_deps=apt_deps,
+        build_script=(
+            _jvm_build_script(target_class, fuzzer_name, libs_cmd)
+            if language == "jvm"
+            else _dockerfile_build_script(project, df_recipe, produced)
+            if df_recipe
+            else (_skia_prelude() if project == "skia" else "")
+            + case_fix
+            + _build_script(fuzzer_name, libs_cmd)
+        ),
+        description=description,
+        extra_clones=extra_clones,
+        pip_deps=pip_deps,
+        base_image=base_image,
+        setup_steps=setup_steps,
+    )
