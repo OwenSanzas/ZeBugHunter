@@ -621,7 +621,7 @@ async def run_pipeline(
     log_dir: Path = None,
     fuzzer_path: Path = None,
     docker_image: str = None,
-    max_iterations: int = 200,
+    max_iterations: int = 100,
     max_pov_attempts: int = 100,
     workspace_path: Path = None,
     fuzzer_code: str = "",
